@@ -4,6 +4,7 @@ import {
   DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER,
   defaultInstanceIdForDriver,
   type ModelSelection,
+  MUSE_DEFAULT_MODEL,
   ProviderDriverKind,
   ProviderInstanceId,
   type ServerProvider,
@@ -98,10 +99,11 @@ function appendUnavailableDynamicModelSelection(
   selectedModel: string | null | undefined,
   hiddenModels: ReadonlyArray<string>,
 ): AppModelOption[] {
-  if (provider !== "opencode" && provider !== "antigravity") return options;
+  if (provider !== "opencode" && provider !== "antigravity" && provider !== "muse") return options;
   const slug = normalizeCustomModelSlug(selectedModel);
   if (!slug) return options;
   if (provider === "antigravity" && slug === ANTIGRAVITY_DEFAULT_MODEL) return options;
+  if (provider === "muse" && slug === MUSE_DEFAULT_MODEL) return options;
 
   // A model that exists in the raw catalog can be absent from `options`
   // because the user hid it. Keep that preference authoritative.
