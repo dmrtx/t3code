@@ -74,6 +74,7 @@ import {
   makeMspUserInputRequestedEvent,
   makeMspUserInputResolvedEvent,
   mapMuseApprovalDecision,
+  mapMuseTurnTerminalToState,
   mapRuntimeModeToMspApprovalMode,
 } from "../msp/MspEvents.ts";
 import type { EventNdjsonLogger } from "./EventNdjsonLogger.ts";
@@ -255,13 +256,8 @@ export function makeMuseAdapter(
 
           case "turn/completed": {
             const turnId = TurnId.make(String(params.turnId ?? ctx.activeTurnId ?? ""));
-            const terminal = String(params.terminal ?? "completed");
-            const state: "completed" | "failed" | "interrupted" | "cancelled" =
-              terminal === "failed"
-                ? "failed"
-                : terminal === "interrupted"
-                  ? "interrupted"
-                  : "completed";
+            const terminal = typeof params.terminal === "string" ? params.terminal : undefined;
+            const state = mapMuseTurnTerminalToState(terminal);
             const err = isRecord(params.error) ? (params.error as { message?: string }) : undefined;
             ctx.activeTurnId = undefined;
             const { activeTurnId: _activeTurnId, ...readySession } = ctx.session;
@@ -827,10 +823,11 @@ export function makeMuseAdapter(
       Effect.gen(function* () {
         const ctx = sessions.get(threadId);
         if (!ctx || ctx.stopped) return;
-        ctx.stopped = true;
+
         const hostOpt = yield* SynchronizedRef.get(hostRef);
         if (Option.isSome(hostOpt)) {
-          // 1. If an active turn is running, interrupt it so execution does not continue
+          // 1. If an active turn is running, interrupt it before modifying session ownership.
+          // In MSP, `turn/interrupt` is the canonical "user pressed stop" priority lane operation.
           if (ctx.activeTurnId || ctx.session.status === "running") {
             yield* hostOpt.value
               .interruptTurn({
@@ -838,19 +835,40 @@ export function makeMuseAdapter(
                 sessionId: ctx.mspSessionId,
                 ...(ctx.activeTurnId ? { turnId: String(ctx.activeTurnId) } : {}),
               })
-              .pipe(Effect.ignore);
+              .pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new ProviderAdapterRequestError({
+                      provider: PROVIDER,
+                      method: "turn/interrupt",
+                      detail: `Muse failed to interrupt active turn ${ctx.activeTurnId ?? ""} for thread ${threadId}: ${cause.detail ?? cause.message ?? String(cause)}`,
+                      cause,
+                    }),
+                ),
+              );
+            // Interruption succeeded: clear active turn from context
+            ctx.activeTurnId = undefined;
+            if (ctx.session.status === "running") {
+              const { activeTurnId: _activeTurnId, ...readySession } = ctx.session;
+              ctx.session = { ...readySession, status: "ready" };
+            }
           }
-          // 2. Unsubscribe view
+
+          // 2. Unsubscribe view. Because the running turn is confirmed stopped,
+          // failure to unsubscribe view is non-fatal to execution safety and
+          // should not prevent T3 from releasing local resources.
           yield* hostOpt.value.unsubscribeView({ sessionId: ctx.mspSessionId }).pipe(Effect.ignore);
         }
-        // 3. Remove local session state
+
+        // 3. Mark stopped and remove local state ONLY after execution has been stopped
+        ctx.stopped = true;
         sessions.delete(threadId);
       });
 
     const stopAll: MuseAdapterShape["stopAll"] = () =>
       Effect.gen(function* () {
         for (const threadId of Array.from(sessions.keys())) {
-          yield* stopSession(threadId);
+          yield* stopSession(threadId).pipe(Effect.ignore);
         }
         const currentHost = yield* SynchronizedRef.get(hostRef);
         if (Option.isSome(currentHost)) {

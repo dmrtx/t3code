@@ -18,7 +18,7 @@ import * as Stream from "effect/Stream";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 
 import { ServerConfig } from "../../config.ts";
-import type { MspHost, MspNotification } from "../msp/MspClient.ts";
+import { type MspHost, type MspNotification, MspTransportError } from "../msp/MspClient.ts";
 import type {
   MspApprovalRequest,
   MspModelInfo,
@@ -29,7 +29,11 @@ import type {
   MspUserInputRequest,
 } from "../msp/MspTypes.ts";
 import { makeMuseAdapter, selectMuseApprovalChoiceId } from "./MuseAdapter.ts";
-import { mapMuseApprovalDecision, mapRuntimeModeToMspApprovalMode } from "../msp/MspEvents.ts";
+import {
+  mapMuseApprovalDecision,
+  mapMuseTurnTerminalToState,
+  mapRuntimeModeToMspApprovalMode,
+} from "../msp/MspEvents.ts";
 
 const testLayer = ServerConfig.layerTest(process.cwd(), {
   prefix: "t3-muse-adapter-test-",
@@ -38,6 +42,7 @@ const testLayer = ServerConfig.layerTest(process.cwd(), {
 const makeMockHost = Effect.gen(function* () {
   const notifPubSub = yield* PubSub.unbounded<MspNotification>();
   const calls = {
+    shouldFailInterrupt: false,
     startSession: [] as MspSessionStartParams[],
     startTurn: [] as MspTurnStartParams[],
     interruptTurn: [] as Array<{
@@ -91,8 +96,16 @@ const makeMockHost = Effect.gen(function* () {
         } satisfies MspTurnStartResult;
       }),
     interruptTurn: (params) =>
-      Effect.sync(() => {
+      Effect.gen(function* () {
         calls.interruptTurn.push(params);
+        if (calls.shouldFailInterrupt) {
+          return yield* Effect.fail(
+            new MspTransportError({
+              operation: "turn/interrupt",
+              detail: "Simulated interrupt failure",
+            }),
+          );
+        }
         return {
           commandId: params.commandId,
           status: "interrupted",
@@ -512,6 +525,140 @@ it.layer(testLayer)("MuseAdapter", (it) => {
         ),
         Effect.scoped,
       ),
+  );
+
+  it.effect(
+    "stopSession: active turn + interrupt failure -> stopSession fails and session remains owned by T3",
+    () =>
+      Effect.gen(function* () {
+        const mock = yield* makeMockHost;
+        const threadId = ThreadId.make("thread-stop-failure");
+
+        const adapter = yield* makeMuseAdapter(
+          { enabled: true, binaryPath: "", customModels: [] },
+          {
+            instanceId: ProviderInstanceId.make("muse-primary"),
+            makeHost: () => Effect.succeed(mock.host),
+          },
+        );
+
+        yield* adapter.startSession({
+          threadId,
+          cwd: "/test",
+          runtimeMode: "approval-required",
+        });
+
+        // Start a turn so that activeTurnId is set and status is 'running'
+        yield* adapter.sendTurn({
+          threadId,
+          input: "Run long running command",
+        });
+
+        // Simulate interrupt failure
+        mock.calls.shouldFailInterrupt = true;
+
+        // stopSession must fail
+        const stopExit = yield* adapter.stopSession(threadId).pipe(Effect.exit);
+        expect(stopExit._tag).toBe("Failure");
+
+        // Interrupt was attempted
+        expect(mock.calls.interruptTurn.length).toBe(1);
+
+        // View was NOT unsubscribed because turn was not stopped
+        expect(mock.calls.unsubscribeView.length).toBe(0);
+
+        // CRITICAL INVARIANT: Session MUST remain owned by T3 (not deleted)
+        expect(yield* adapter.hasSession(threadId)).toBe(true);
+        const sessions = yield* adapter.listSessions();
+        const active = sessions.find((s) => s.threadId === threadId);
+        expect(active).toBeDefined();
+        expect(active?.status).toBe("running");
+
+        // Retry stopSession when interrupt succeeds
+        mock.calls.shouldFailInterrupt = false;
+        yield* adapter.stopSession(threadId);
+
+        expect(mock.calls.interruptTurn.length).toBe(2);
+        expect(mock.calls.unsubscribeView.length).toBe(1);
+        expect(yield* adapter.hasSession(threadId)).toBe(false);
+      }).pipe(
+        Effect.provideService(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make(() => Effect.die("Mock host does not spawn")),
+        ),
+        Effect.scoped,
+      ),
+  );
+
+  it.effect("maps turn/completed terminal cancellation to canonical cancelled state", () =>
+    Effect.gen(function* () {
+      // 1. Direct unit test of mapMuseTurnTerminalToState
+      expect(mapMuseTurnTerminalToState("completed")).toBe("completed");
+      expect(mapMuseTurnTerminalToState("failed")).toBe("failed");
+      expect(mapMuseTurnTerminalToState("interrupted")).toBe("interrupted");
+      expect(mapMuseTurnTerminalToState("cancelled")).toBe("cancelled");
+      expect(mapMuseTurnTerminalToState("canceled")).toBe("cancelled");
+      expect(mapMuseTurnTerminalToState(undefined)).toBe("completed");
+
+      // 2. Integration with event stream: emit turn/completed with terminal: "cancelled"
+      const mock = yield* makeMockHost;
+      const threadId = ThreadId.make("thread-turn-cancelled");
+
+      const adapter = yield* makeMuseAdapter(
+        { enabled: true, binaryPath: "", customModels: [] },
+        {
+          instanceId: ProviderInstanceId.make("muse-primary"),
+          makeHost: () => Effect.succeed(mock.host),
+        },
+      );
+
+      const eventsQueue = yield* Queue.unbounded<any>();
+      yield* adapter.streamEvents.pipe(
+        Stream.runForEach((event) => Queue.offer(eventsQueue, event)),
+        Effect.forkScoped,
+      );
+      yield* Effect.yieldNow;
+
+      yield* adapter.startSession({
+        threadId,
+        cwd: "/test",
+        runtimeMode: "approval-required",
+      });
+      yield* Effect.yieldNow;
+
+      yield* mock.emitNotification({
+        method: "turn/completed",
+        params: {
+          sessionId: "msp-sess-42",
+          turnId: "msp-turn-cancelled",
+          terminal: "cancelled",
+        },
+      });
+
+      const event1 = yield* Queue.take(eventsQueue);
+      expect(event1.type).toBe("turn.completed");
+      expect(event1.payload.state).toBe("cancelled");
+
+      // Also verify American spelling "canceled"
+      yield* mock.emitNotification({
+        method: "turn/completed",
+        params: {
+          sessionId: "msp-sess-42",
+          turnId: "msp-turn-canceled-2",
+          terminal: "canceled",
+        },
+      });
+
+      const event2 = yield* Queue.take(eventsQueue);
+      expect(event2.type).toBe("turn.completed");
+      expect(event2.payload.state).toBe("cancelled");
+    }).pipe(
+      Effect.provideService(
+        ChildProcessSpawner.ChildProcessSpawner,
+        ChildProcessSpawner.make(() => Effect.die("Mock host does not spawn")),
+      ),
+      Effect.scoped,
+    ),
   );
 
   it.effect(

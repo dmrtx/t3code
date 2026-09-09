@@ -97,12 +97,6 @@ export function getMuseFallbackModels(settings: MuseSettings): ReadonlyArray<Ser
       isCustom: false,
       capabilities: DEFAULT_MUSE_MODEL_CAPABILITIES,
     },
-    {
-      slug: "echo",
-      name: "Echo (Offline Test)",
-      isCustom: false,
-      capabilities: createModelCapabilities({ optionDescriptors: [] }),
-    },
   ];
 
   return providerModelsFromSettings(
@@ -264,16 +258,6 @@ export function makeMuseModelDiscovery(
           isCustom: false,
           isDefault: entry.isDefault || slug === MUSE_DEFAULT_MODEL,
           capabilities: DEFAULT_MUSE_MODEL_CAPABILITIES,
-        });
-      }
-
-      // Always ensure offline echo model is present for smoke tests / testing
-      if (!seen.has("echo")) {
-        discovered.push({
-          slug: "echo",
-          name: "Echo (Offline Test)",
-          isCustom: false,
-          capabilities: createModelCapabilities({ optionDescriptors: [] }),
         });
       }
 

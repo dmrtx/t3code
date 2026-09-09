@@ -131,6 +131,29 @@ export function mapMuseApprovalDecision(decision: string): ProviderApprovalDecis
   return parsed.value;
 }
 
+/**
+ * Maps Muse MSP TurnTerminal values to T3's canonical turn completion states.
+ *
+ * In `muse schema`, `TurnTerminal = "completed" | "failed" | "cancelled" | (string & {})`.
+ * Acceptance of `turn/interrupt` means the interrupt was admitted, and the turn is
+ * over when `turn/completed` arrives with terminal `"cancelled"`.
+ */
+export function mapMuseTurnTerminalToState(
+  terminal?: string,
+): "completed" | "failed" | "interrupted" | "cancelled" {
+  switch (terminal) {
+    case "failed":
+      return "failed";
+    case "interrupted":
+      return "interrupted";
+    case "cancelled":
+    case "canceled":
+      return "cancelled";
+    default:
+      return "completed";
+  }
+}
+
 export function mapMuseApprovalChoices(
   choices: ReadonlyArray<MspApprovalChoice>,
 ): ReadonlyArray<ProviderApprovalOption> {
