@@ -10,7 +10,6 @@ import {
   ApprovalRequestId,
   EventId,
   type IsoDateTime,
-  type ModelSelection,
   type MuseSettings,
   type ProviderApprovalDecision,
   ProviderDriverKind,
@@ -18,21 +17,16 @@ import {
   type ProviderRuntimeEvent,
   type ProviderSendTurnInput,
   type ProviderSession,
-  type ProviderSessionStartInput,
   type ProviderTurnStartResult,
-  type ProviderUserInputAnswers,
   ThreadId,
   TurnId,
 } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
-import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
-import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
-import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SynchronizedRef from "effect/SynchronizedRef";
@@ -80,6 +74,7 @@ import {
   makeMspUserInputRequestedEvent,
   makeMspUserInputResolvedEvent,
   mapMuseApprovalDecision,
+  mapRuntimeModeToMspApprovalMode,
 } from "../msp/MspEvents.ts";
 import type { EventNdjsonLogger } from "./EventNdjsonLogger.ts";
 
@@ -131,36 +126,52 @@ function appendItemToTurn(ctx: MuseSessionContext, turnId: TurnId, item: unknown
 export function selectMuseApprovalChoiceId(
   request: MspApprovalRequest,
   decision: ProviderApprovalDecision,
-): string {
+): Option.Option<string> {
   const choices = request.availableChoices;
   if (choices.length === 0) {
-    return "abort";
+    return Option.none();
   }
   if (decision === "acceptAlways") {
     const alwaysChoice = choices.find(
       (c) => c.decision === "approvedPolicyAmendment" || c.scope === "localPersistent",
     );
-    if (alwaysChoice) return alwaysChoice.choiceId;
+    if (alwaysChoice) return Option.some(alwaysChoice.choiceId);
   }
   if (decision === "acceptForSession" || decision === "acceptAlways") {
     const sessionChoice = choices.find(
       (c) => c.decision === "approvedForSession" || c.scope === "session",
     );
-    if (sessionChoice) return sessionChoice.choiceId;
+    if (sessionChoice) return Option.some(sessionChoice.choiceId);
   }
   if (decision === "accept" || decision === "acceptForSession" || decision === "acceptAlways") {
     const approvedChoice = choices.find(
       (c) => c.decision === "approved" || c.decision === "approvedPolicyAmendment",
     );
-    if (approvedChoice) return approvedChoice.choiceId;
+    if (approvedChoice) return Option.some(approvedChoice.choiceId);
+    // Never pick a deny/abort choice when user wanted to accept!
+    return Option.none();
   }
   if (decision === "decline") {
-    const deniedChoice = choices.find((c) => c.decision === "denied");
-    if (deniedChoice) return deniedChoice.choiceId;
+    const deniedChoice = choices.find(
+      (c) => c.decision === "denied" || c.decision === "deniedPolicyAmendment",
+    );
+    if (deniedChoice) return Option.some(deniedChoice.choiceId);
+    const abortChoice = choices.find((c) => c.decision === "abort");
+    if (abortChoice) return Option.some(abortChoice.choiceId);
+    // Never pick an approved choice when user wanted to decline!
+    return Option.none();
   }
-  // cancel or fallback
-  const abortChoice = choices.find((c) => c.decision === "abort" || c.decision === "denied");
-  return abortChoice ? abortChoice.choiceId : choices[0]!.choiceId;
+  if (decision === "cancel") {
+    const abortChoice = choices.find((c) => c.decision === "abort");
+    if (abortChoice) return Option.some(abortChoice.choiceId);
+    const deniedChoice = choices.find(
+      (c) => c.decision === "denied" || c.decision === "deniedPolicyAmendment",
+    );
+    if (deniedChoice) return Option.some(deniedChoice.choiceId);
+    // Never pick an approved choice when user wanted to cancel!
+    return Option.none();
+  }
+  return Option.none();
 }
 
 export function makeMuseAdapter(
@@ -172,7 +183,6 @@ export function makeMuseAdapter(
   | ChildProcessSpawner.ChildProcessSpawner
   | Crypto.Crypto
   | FileSystem.FileSystem
-  | Path.Path
   | ServerConfig
   | Scope.Scope
 > {
@@ -180,7 +190,6 @@ export function makeMuseAdapter(
     const boundInstanceId = options?.instanceId ?? ProviderInstanceId.make("muse");
     const crypto = yield* Crypto.Crypto;
     const fileSystem = yield* FileSystem.FileSystem;
-    const path = yield* Path.Path;
     const serverConfig = yield* ServerConfig;
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const adapterScope = yield* Scope.Scope;
@@ -486,16 +495,20 @@ export function makeMuseAdapter(
         );
       });
 
-    const requireSession = (threadId: ThreadId) =>
-      Effect.sync(() => {
+    const requireSession = (
+      threadId: ThreadId,
+    ): Effect.Effect<MuseSessionContext, ProviderAdapterSessionNotFoundError> =>
+      Effect.suspend(() => {
         const ctx = sessions.get(threadId);
         if (!ctx || ctx.stopped) {
-          throw new ProviderAdapterSessionNotFoundError({
-            provider: PROVIDER,
-            threadId,
-          });
+          return Effect.fail(
+            new ProviderAdapterSessionNotFoundError({
+              provider: PROVIDER,
+              threadId,
+            }),
+          );
         }
-        return ctx;
+        return Effect.succeed(ctx);
       });
 
     const startSession: MuseAdapterShape["startSession"] = (input) =>
@@ -503,9 +516,11 @@ export function makeMuseAdapter(
         const host = yield* getHost;
         const commandId = newMspCommandId();
         const modelId = input.modelSelection?.model;
+        const approvalMode = mapRuntimeModeToMspApprovalMode(input.runtimeMode);
         const startResult = yield* host
           .startSession({
             commandId,
+            approvalMode,
             ...(input.cwd ? { workspaceRoot: input.cwd } : {}),
             ...(modelId ? { modelId } : {}),
           })
@@ -591,6 +606,33 @@ export function makeMuseAdapter(
           }
         }
 
+        // In-session model switch: apply changed model if requested
+        const targetModel = input.modelSelection?.model;
+        if (targetModel && targetModel !== ctx.session.model) {
+          yield* host
+            .setModel({
+              commandId: newMspCommandId(),
+              sessionId: ctx.mspSessionId,
+              modelId: targetModel,
+            })
+            .pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProviderAdapterRequestError({
+                    provider: PROVIDER,
+                    method: "session/setModel",
+                    detail: `Muse setModel failed for thread ${input.threadId}: ${cause.detail ?? cause.message ?? String(cause)}`,
+                    cause,
+                  }),
+              ),
+            );
+          ctx.session = {
+            ...ctx.session,
+            model: targetModel,
+            updatedAt: yield* nowIso,
+          };
+        }
+
         const commandId = newMspCommandId();
         const ifBusy = ctx.activeTurnId ? ("steer" as const) : undefined;
         const reasoningEffort = input.modelSelection
@@ -669,7 +711,15 @@ export function makeMuseAdapter(
           });
         }
         const host = yield* getHost;
-        const choiceId = selectMuseApprovalChoiceId(pending.request, decision);
+        const choiceIdOpt = selectMuseApprovalChoiceId(pending.request, decision);
+        if (Option.isNone(choiceIdOpt)) {
+          return yield* new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method: "approval/decide",
+            detail: `No compatible Muse approval choice found for decision '${decision}' in approval ${requestId}`,
+          });
+        }
+        const choiceId = choiceIdOpt.value;
         const commandId = newMspCommandId();
         yield* host
           .decideApproval({
@@ -776,18 +826,30 @@ export function makeMuseAdapter(
     const stopSession: MuseAdapterShape["stopSession"] = (threadId) =>
       Effect.gen(function* () {
         const ctx = sessions.get(threadId);
-        if (!ctx) return;
+        if (!ctx || ctx.stopped) return;
         ctx.stopped = true;
         const hostOpt = yield* SynchronizedRef.get(hostRef);
         if (Option.isSome(hostOpt)) {
+          // 1. If an active turn is running, interrupt it so execution does not continue
+          if (ctx.activeTurnId || ctx.session.status === "running") {
+            yield* hostOpt.value
+              .interruptTurn({
+                commandId: newMspCommandId(),
+                sessionId: ctx.mspSessionId,
+                ...(ctx.activeTurnId ? { turnId: String(ctx.activeTurnId) } : {}),
+              })
+              .pipe(Effect.ignore);
+          }
+          // 2. Unsubscribe view
           yield* hostOpt.value.unsubscribeView({ sessionId: ctx.mspSessionId }).pipe(Effect.ignore);
         }
+        // 3. Remove local session state
         sessions.delete(threadId);
       });
 
     const stopAll: MuseAdapterShape["stopAll"] = () =>
       Effect.gen(function* () {
-        for (const threadId of [...sessions.keys()]) {
+        for (const threadId of Array.from(sessions.keys())) {
           yield* stopSession(threadId);
         }
         const currentHost = yield* SynchronizedRef.get(hostRef);

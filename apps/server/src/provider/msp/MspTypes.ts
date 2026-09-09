@@ -13,12 +13,14 @@ export interface MspTurnInputPart {
   readonly height?: number | undefined;
 }
 
+export type MspApprovalMode = "allowAll" | "promptUnmatched" | "onRequest" | "denyUnmatched";
+
 export interface MspSessionStartParams {
   readonly commandId: string;
   readonly workspaceRoot?: string | undefined;
   readonly modelId?: string | undefined;
   readonly providerId?: string | null | undefined;
-  readonly approvalMode?: string | null | undefined;
+  readonly approvalMode?: MspApprovalMode | null | undefined;
 }
 
 export interface MspSessionSummary {
@@ -31,6 +33,18 @@ export interface MspSessionSummary {
 }
 
 export interface MspSessionStartResult {
+  readonly session: MspSessionSummary;
+  readonly viewCursor: string;
+}
+
+export interface MspSessionResumeParams {
+  readonly commandId: string;
+  readonly sessionId: string;
+  readonly cursor?: string | null | undefined;
+  readonly excludeItems?: boolean | undefined;
+}
+
+export interface MspSessionResumeResult {
   readonly session: MspSessionSummary;
   readonly viewCursor: string;
 }
@@ -52,9 +66,32 @@ export interface MspTurnStartResult {
   readonly turnId: string;
 }
 
+export interface MspTurnInterruptParams {
+  readonly commandId: string;
+  readonly sessionId: string;
+  readonly turnId?: string | undefined;
+  readonly retract?: boolean | undefined;
+}
+
+export interface MspTurnCancelParams {
+  readonly commandId: string;
+  readonly sessionId: string;
+  readonly turnId?: string | undefined;
+}
+
+export type MspApprovalDecision =
+  | "approved"
+  | "approvedForSession"
+  | "approvedPolicyAmendment"
+  | "denied"
+  | "deniedPolicyAmendment"
+  | "timedOut"
+  | "abort"
+  | (string & {});
+
 export interface MspApprovalChoice {
   readonly choiceId: string;
-  readonly decision: string;
+  readonly decision: MspApprovalDecision;
   readonly label: string;
   readonly acceptsFeedback?: boolean | undefined;
   readonly scope: string;

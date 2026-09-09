@@ -13,7 +13,7 @@ import * as Schema from "effect/Schema";
 import * as ChildProcess from "effect/unstable/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
-import { isCommandMissingCause, spawnAndCollect } from "../providerSnapshot.ts";
+import { spawnAndCollect } from "../providerSnapshot.ts";
 
 const MuseSkillItemSchema = Schema.Struct({
   id: Schema.String,

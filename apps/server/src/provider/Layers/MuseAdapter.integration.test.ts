@@ -1,4 +1,5 @@
 // @effect-diagnostics nodeBuiltinImport:off
+import * as NodeChildProcess from "node:child_process";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import { ProviderDriverKind, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
@@ -12,11 +13,32 @@ import * as Stream from "effect/Stream";
 import { ServerConfig } from "../../config.ts";
 import { makeMuseAdapter } from "./MuseAdapter.ts";
 
+function resolveMuseBinary(): string | undefined {
+  const envBinary = process.env.MUSE_BINARY;
+  if (envBinary && envBinary.trim().length > 0) {
+    return envBinary.trim();
+  }
+  try {
+    const result = NodeChildProcess.spawnSync("muse", ["--version"], {
+      stdio: "ignore",
+      encoding: "utf8",
+    });
+    if (result.status === 0) {
+      return "muse";
+    }
+  } catch {
+    // ignore
+  }
+  return undefined;
+}
+
+const resolvedMuseBinary = resolveMuseBinary();
+
 const testLayer = ServerConfig.layerTest(process.cwd(), {
   prefix: "t3-muse-integration-test-",
 }).pipe(Layer.provideMerge(NodeServices.layer));
 
-describe("MuseAdapter live integration with muse serve", () => {
+describe.skipIf(!resolvedMuseBinary)("MuseAdapter live integration with muse serve", () => {
   it.layer(testLayer)(
     "spawns live muse serve, creates session and executes turn with echo model",
     (it) => {
@@ -28,7 +50,7 @@ describe("MuseAdapter live integration with muse serve", () => {
           const adapter = yield* makeMuseAdapter(
             {
               enabled: true,
-              binaryPath: "/Users/morotxo/.local/bin/muse",
+              binaryPath: resolvedMuseBinary!,
               customModels: [],
             },
             {

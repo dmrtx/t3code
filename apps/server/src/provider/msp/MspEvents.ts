@@ -16,17 +16,19 @@ import {
   type ProviderRuntimeEvent,
   RuntimeItemId,
   RuntimeRequestId,
+  type RuntimeMode,
   type ThreadId,
   type ToolLifecycleItemType,
   TurnId,
   type UserInputQuestion,
 } from "@t3tools/contracts";
+import * as Option from "effect/Option";
 
 import type {
   MspApprovalChoice,
+  MspApprovalMode,
   MspApprovalRequest,
   MspApprovalSubject,
-  MspItem,
   MspUserInputQuestion,
   MspUserInputRequest,
 } from "./MspTypes.ts";
@@ -79,21 +81,54 @@ export function canonicalRequestTypeFromMuseSubject(
   return "dynamic_tool_call";
 }
 
-export function mapMuseApprovalDecision(decision: string): ProviderApprovalDecision {
+/**
+ * Maps T3 RuntimeMode to Muse MSP ApprovalMode.
+ *
+ * - "full-access" -> "allowAll" (bypasses permission checks)
+ * - "approval-required" -> "onRequest" (interactive approval on every sensitive request)
+ * - "auto-accept-edits" -> "promptUnmatched" (MSP lacks edit-only auto-approval; promptUnmatched is safest)
+ * - "auto" -> "promptUnmatched" (default interactive mode for matching preconfigured policies)
+ */
+export function mapRuntimeModeToMspApprovalMode(runtimeMode: RuntimeMode): MspApprovalMode {
+  switch (runtimeMode) {
+    case "full-access":
+      return "allowAll";
+    case "approval-required":
+      return "onRequest";
+    case "auto-accept-edits":
+    case "auto":
+      return "promptUnmatched";
+  }
+}
+
+export function parseMuseApprovalDecision(
+  decision: string,
+): Option.Option<ProviderApprovalDecision> {
   switch (decision) {
     case "approved":
-      return "accept";
+      return Option.some("accept");
     case "approvedForSession":
-      return "acceptForSession";
+      return Option.some("acceptForSession");
     case "approvedPolicyAmendment":
-      return "acceptAlways";
+      return Option.some("acceptAlways");
     case "denied":
-      return "decline";
+    case "deniedPolicyAmendment":
+      return Option.some("decline");
     case "abort":
-      return "cancel";
+    case "timedOut":
+      return Option.some("cancel");
     default:
-      return "accept";
+      return Option.none();
   }
+}
+
+export function mapMuseApprovalDecision(decision: string): ProviderApprovalDecision {
+  const parsed = parseMuseApprovalDecision(decision);
+  if (Option.isNone(parsed)) {
+    // Fail closed: an unknown/unrecognized decision must never become "accept"
+    return "cancel";
+  }
+  return parsed.value;
 }
 
 export function mapMuseApprovalChoices(

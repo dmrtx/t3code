@@ -1,6 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { describe, expect, it } from "@effect/vitest";
+import { expect, it } from "@effect/vitest";
 import {
   ApprovalRequestId,
   ProviderApprovalDecision,
@@ -9,9 +9,9 @@ import {
   ThreadId,
   TurnId,
 } from "@t3tools/contracts";
-import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
@@ -28,7 +28,8 @@ import type {
   MspTurnStartResult,
   MspUserInputRequest,
 } from "../msp/MspTypes.ts";
-import { makeMuseAdapter } from "./MuseAdapter.ts";
+import { makeMuseAdapter, selectMuseApprovalChoiceId } from "./MuseAdapter.ts";
+import { mapMuseApprovalDecision, mapRuntimeModeToMspApprovalMode } from "../msp/MspEvents.ts";
 
 const testLayer = ServerConfig.layerTest(process.cwd(), {
   prefix: "t3-muse-adapter-test-",
@@ -44,6 +45,11 @@ const makeMockHost = Effect.gen(function* () {
       sessionId: string;
       turnId?: string | undefined;
     }>,
+    setModel: [] as Array<{
+      commandId: string;
+      sessionId: string;
+      modelId: string;
+    }>,
     decideApproval: [] as Array<{
       commandId: string;
       sessionId: string;
@@ -52,6 +58,7 @@ const makeMockHost = Effect.gen(function* () {
     }>,
     answerUserInput: [] as Array<{ commandId: string; sessionId: string; userInputId: string }>,
     compact: [] as Array<{ commandId: string; sessionId: string }>,
+    unsubscribeView: [] as Array<{ sessionId: string }>,
   };
 
   const host: MspHost = {
@@ -92,7 +99,11 @@ const makeMockHost = Effect.gen(function* () {
           turnId: params.turnId ?? "msp-turn-101",
         };
       }),
-    setModel: (params) => Effect.succeed({ commandId: params.commandId, status: "accepted" }),
+    setModel: (params) =>
+      Effect.sync(() => {
+        calls.setModel.push(params);
+        return { commandId: params.commandId, status: "accepted" };
+      }),
     compact: (params) =>
       Effect.sync(() => {
         calls.compact.push(params);
@@ -123,7 +134,26 @@ const makeMockHost = Effect.gen(function* () {
       Effect.succeed([
         { modelId: "muse-spark-1.3", displayLabel: "Muse Spark 1.3", isDefault: true },
       ] satisfies ReadonlyArray<MspModelInfo>),
-    unsubscribeView: () => Effect.void,
+    unsubscribeView: (params) =>
+      Effect.sync(() => {
+        calls.unsubscribeView.push(params);
+      }),
+    resumeSession: (params) =>
+      Effect.succeed({
+        session: {
+          sessionId: params.sessionId,
+          status: "ready",
+          activeTurnId: null,
+          workspaceRoot: "/workspace/project",
+        },
+        viewCursor: "cursor-1",
+      }),
+    cancelTurn: (params) =>
+      Effect.succeed({
+        commandId: params.commandId,
+        status: "cancelled",
+        turnId: params.turnId ?? "msp-turn-101",
+      }),
     close: Effect.void,
   };
 
@@ -420,6 +450,351 @@ it.layer(testLayer)("MuseAdapter", (it) => {
 
       expect(mock.calls.answerUserInput.length).toBe(1);
       expect(mock.calls.answerUserInput[0]?.userInputId).toBe("ui-888");
+    }).pipe(
+      Effect.provideService(
+        ChildProcessSpawner.ChildProcessSpawner,
+        ChildProcessSpawner.make(() => Effect.die("Mock host does not spawn")),
+      ),
+      Effect.scoped,
+    ),
+  );
+
+  it.effect(
+    "stopSession interrupts active turn and unsubscribes view before removing local state",
+    () =>
+      Effect.gen(function* () {
+        const mock = yield* makeMockHost;
+        const threadId = ThreadId.make("thread-stop-active");
+
+        const adapter = yield* makeMuseAdapter(
+          { enabled: true, binaryPath: "", customModels: [] },
+          {
+            instanceId: ProviderInstanceId.make("muse-primary"),
+            makeHost: () => Effect.succeed(mock.host),
+          },
+        );
+
+        yield* adapter.startSession({
+          threadId,
+          cwd: "/test",
+          runtimeMode: "approval-required",
+        });
+
+        // Start a turn so that activeTurnId is set and status is 'running'
+        yield* adapter.sendTurn({
+          threadId,
+          input: "Run a command",
+        });
+
+        expect(mock.calls.interruptTurn.length).toBe(0);
+        expect(mock.calls.unsubscribeView.length).toBe(0);
+
+        // Stop session while turn is active
+        yield* adapter.stopSession(threadId);
+
+        // Verify that turn was interrupted
+        expect(mock.calls.interruptTurn.length).toBe(1);
+        expect(mock.calls.interruptTurn[0]?.sessionId).toBe("msp-sess-42");
+        expect(mock.calls.interruptTurn[0]?.turnId).toBe("msp-turn-101");
+
+        // Verify view was unsubscribed
+        expect(mock.calls.unsubscribeView.length).toBe(1);
+        expect(mock.calls.unsubscribeView[0]?.sessionId).toBe("msp-sess-42");
+
+        // Verify local state was cleaned up
+        expect(yield* adapter.hasSession(threadId)).toBe(false);
+        const list = yield* adapter.listSessions();
+        expect(list.find((s) => s.threadId === threadId)).toBeUndefined();
+      }).pipe(
+        Effect.provideService(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make(() => Effect.die("Mock host does not spawn")),
+        ),
+        Effect.scoped,
+      ),
+  );
+
+  it.effect(
+    "sessionModelSwitch calls session/setModel when model changes and updates session",
+    () =>
+      Effect.gen(function* () {
+        const mock = yield* makeMockHost;
+        const threadId = ThreadId.make("thread-model-switch");
+
+        const adapter = yield* makeMuseAdapter(
+          { enabled: true, binaryPath: "", customModels: [] },
+          {
+            instanceId: ProviderInstanceId.make("muse-primary"),
+            makeHost: () => Effect.succeed(mock.host),
+          },
+        );
+
+        yield* adapter.startSession({
+          threadId,
+          cwd: "/test",
+          runtimeMode: "approval-required",
+        });
+
+        // Send turn with a model selection
+        yield* adapter.sendTurn({
+          threadId,
+          input: "Hello model switch",
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("muse-primary"),
+            model: "muse-spark-1.3",
+          },
+        });
+
+        expect(mock.calls.setModel.length).toBe(1);
+        expect(mock.calls.setModel[0]?.sessionId).toBe("msp-sess-42");
+        expect(mock.calls.setModel[0]?.modelId).toBe("muse-spark-1.3");
+
+        const sessions1 = yield* adapter.listSessions();
+        expect(sessions1.find((s) => s.threadId === threadId)?.model).toBe("muse-spark-1.3");
+
+        // Send another turn with the same model: setModel should NOT be called again
+        yield* adapter.sendTurn({
+          threadId,
+          input: "Second turn same model",
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("muse-primary"),
+            model: "muse-spark-1.3",
+          },
+        });
+
+        expect(mock.calls.setModel.length).toBe(1);
+
+        // Send another turn with a DIFFERENT model: setModel SHOULD be called
+        yield* adapter.sendTurn({
+          threadId,
+          input: "Third turn different model",
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("muse-primary"),
+            model: "muse-spark-pro",
+          },
+        });
+
+        expect(mock.calls.setModel.length).toBe(2);
+        expect(mock.calls.setModel[1]?.modelId).toBe("muse-spark-pro");
+
+        const sessions2 = yield* adapter.listSessions();
+        expect(sessions2.find((s) => s.threadId === threadId)?.model).toBe("muse-spark-pro");
+      }).pipe(
+        Effect.provideService(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make(() => Effect.die("Mock host does not spawn")),
+        ),
+        Effect.scoped,
+      ),
+  );
+
+  it.effect(
+    "fails closed on unknown approval decisions and never selects approved for decline/cancel",
+    () =>
+      Effect.gen(function* () {
+        // 1. Test mapMuseApprovalDecision directly
+        expect(mapMuseApprovalDecision("approved")).toBe("accept");
+        expect(mapMuseApprovalDecision("approvedForSession")).toBe("acceptForSession");
+        expect(mapMuseApprovalDecision("approvedPolicyAmendment")).toBe("acceptAlways");
+        expect(mapMuseApprovalDecision("denied")).toBe("decline");
+        expect(mapMuseApprovalDecision("abort")).toBe("cancel");
+        expect(mapMuseApprovalDecision("timedOut")).toBe("cancel");
+        // Fail closed for unknown decisions
+        expect(mapMuseApprovalDecision("unknown")).toBe("cancel");
+        expect(mapMuseApprovalDecision("something_else")).toBe("cancel");
+        expect(mapMuseApprovalDecision("")).toBe("cancel");
+
+        // 2. Test selectMuseApprovalChoiceId
+        const allowChoice = {
+          choiceId: "c-allow",
+          decision: "approved",
+          label: "Allow",
+          scope: "turn" as const,
+        };
+        const denyChoice = {
+          choiceId: "c-deny",
+          decision: "denied",
+          label: "Deny",
+          scope: "turn" as const,
+        };
+        const abortChoice = {
+          choiceId: "c-abort",
+          decision: "abort",
+          label: "Abort",
+          scope: "turn" as const,
+        };
+
+        const baseReq: MspApprovalRequest = {
+          approvalId: "app-1",
+          sessionId: "s-1",
+          turnId: "turn-1",
+          itemId: "item-1",
+          toolCallId: "tc-1",
+          toolName: "Bash",
+          subject: { kind: "command", command: "test" },
+          rawArgs: "{}",
+          currentRequirementId: { approvalId: "app-1", sourceIndex: 0 },
+          availableChoices: [allowChoice, denyChoice],
+          viewCursor: "c-1",
+        };
+
+        // Both choices available:
+        expect(selectMuseApprovalChoiceId(baseReq, "accept")).toEqual(Option.some("c-allow"));
+        expect(selectMuseApprovalChoiceId(baseReq, "decline")).toEqual(Option.some("c-deny"));
+        expect(selectMuseApprovalChoiceId(baseReq, "cancel")).toEqual(Option.some("c-deny"));
+
+        // Only allow choice available: decline and cancel MUST fail closed (Option.none()), NEVER pick approved
+        const allowOnlyReq: MspApprovalRequest = {
+          ...baseReq,
+          availableChoices: [allowChoice],
+        };
+        expect(selectMuseApprovalChoiceId(allowOnlyReq, "accept")).toEqual(Option.some("c-allow"));
+        expect(selectMuseApprovalChoiceId(allowOnlyReq, "decline")).toEqual(Option.none());
+        expect(selectMuseApprovalChoiceId(allowOnlyReq, "cancel")).toEqual(Option.none());
+
+        // Only deny choice available: accept MUST fail closed (Option.none()), NEVER pick denied
+        const denyOnlyReq: MspApprovalRequest = {
+          ...baseReq,
+          availableChoices: [denyChoice],
+        };
+        expect(selectMuseApprovalChoiceId(denyOnlyReq, "accept")).toEqual(Option.none());
+        expect(selectMuseApprovalChoiceId(denyOnlyReq, "decline")).toEqual(Option.some("c-deny"));
+        expect(selectMuseApprovalChoiceId(denyOnlyReq, "cancel")).toEqual(Option.some("c-deny"));
+
+        // With abort choice: cancel prefers abort
+        const abortReq: MspApprovalRequest = {
+          ...baseReq,
+          availableChoices: [allowChoice, denyChoice, abortChoice],
+        };
+        expect(selectMuseApprovalChoiceId(abortReq, "cancel")).toEqual(Option.some("c-abort"));
+
+        // 3. Test respondToRequest fails with ProviderAdapterRequestError when Option.none() is returned
+        const mock = yield* makeMockHost;
+        const threadId = ThreadId.make("thread-fail-closed");
+
+        const adapter = yield* makeMuseAdapter(
+          { enabled: true, binaryPath: "", customModels: [] },
+          {
+            instanceId: ProviderInstanceId.make("muse-primary"),
+            makeHost: () => Effect.succeed(mock.host),
+          },
+        );
+
+        yield* adapter.startSession({
+          threadId,
+          cwd: "/test",
+          runtimeMode: "approval-required",
+        });
+
+        // Emit approval with ONLY approved choice
+        yield* mock.emitNotification({
+          method: "approval/requested",
+          params: allowOnlyReq as unknown as Record<string, unknown>,
+        });
+
+        // User tries to decline, but only allow is available -> should fail with typed error
+        const declineResult = yield* adapter
+          .respondToRequest(threadId, ApprovalRequestId.make("app-1"), "decline")
+          .pipe(Effect.exit);
+
+        expect(declineResult._tag).toBe("Failure");
+      }).pipe(
+        Effect.provideService(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make(() => Effect.die("Mock host does not spawn")),
+        ),
+        Effect.scoped,
+      ),
+  );
+
+  it.effect("requireSession fails via typed ProviderAdapterSessionNotFoundError channel", () =>
+    Effect.gen(function* () {
+      const mock = yield* makeMockHost;
+      const threadId = ThreadId.make("thread-nonexistent");
+
+      const adapter = yield* makeMuseAdapter(
+        { enabled: true, binaryPath: "", customModels: [] },
+        {
+          instanceId: ProviderInstanceId.make("muse-primary"),
+          makeHost: () => Effect.succeed(mock.host),
+        },
+      );
+
+      // sendTurn on nonexistent session
+      const sendTurnError = yield* adapter.sendTurn({ threadId, input: "hello" }).pipe(Effect.flip);
+      expect(sendTurnError._tag).toBe("ProviderAdapterSessionNotFoundError");
+      expect(sendTurnError.provider).toBe("muse");
+
+      // readThread on nonexistent session
+      const readThreadError = yield* adapter.readThread(threadId).pipe(Effect.flip);
+      expect(readThreadError._tag).toBe("ProviderAdapterSessionNotFoundError");
+
+      // interruptTurn on nonexistent session
+      const interruptError = yield* adapter.interruptTurn(threadId).pipe(Effect.flip);
+      expect(interruptError._tag).toBe("ProviderAdapterSessionNotFoundError");
+
+      // respondToRequest on nonexistent session
+      const respondError = yield* adapter
+        .respondToRequest(threadId, ApprovalRequestId.make("req-1"), "accept")
+        .pipe(Effect.flip);
+      expect(respondError._tag).toBe("ProviderAdapterSessionNotFoundError");
+    }).pipe(
+      Effect.provideService(
+        ChildProcessSpawner.ChildProcessSpawner,
+        ChildProcessSpawner.make(() => Effect.die("Mock host does not spawn")),
+      ),
+      Effect.scoped,
+    ),
+  );
+
+  it.effect("startSession maps runtimeMode to MSP approvalMode", () =>
+    Effect.gen(function* () {
+      const mock = yield* makeMockHost;
+
+      const adapter = yield* makeMuseAdapter(
+        { enabled: true, binaryPath: "", customModels: [] },
+        {
+          instanceId: ProviderInstanceId.make("muse-primary"),
+          makeHost: () => Effect.succeed(mock.host),
+        },
+      );
+
+      expect(mapRuntimeModeToMspApprovalMode("full-access")).toBe("allowAll");
+      expect(mapRuntimeModeToMspApprovalMode("approval-required")).toBe("onRequest");
+      expect(mapRuntimeModeToMspApprovalMode("auto")).toBe("promptUnmatched");
+      expect(mapRuntimeModeToMspApprovalMode("auto-accept-edits")).toBe("promptUnmatched");
+
+      // full-access -> allowAll
+      yield* adapter.startSession({
+        threadId: ThreadId.make("thread-fa"),
+        cwd: "/test",
+        runtimeMode: "full-access",
+      });
+      expect(mock.calls.startSession[0]?.approvalMode).toBe("allowAll");
+
+      // approval-required -> onRequest
+      yield* adapter.startSession({
+        threadId: ThreadId.make("thread-ar"),
+        cwd: "/test",
+        runtimeMode: "approval-required",
+      });
+      expect(mock.calls.startSession[1]?.approvalMode).toBe("onRequest");
+
+      // auto -> promptUnmatched
+      yield* adapter.startSession({
+        threadId: ThreadId.make("thread-auto"),
+        cwd: "/test",
+        runtimeMode: "auto",
+      });
+      expect(mock.calls.startSession[2]?.approvalMode).toBe("promptUnmatched");
+
+      // auto-accept-edits -> promptUnmatched
+      yield* adapter.startSession({
+        threadId: ThreadId.make("thread-aae"),
+        cwd: "/test",
+        runtimeMode: "auto-accept-edits",
+      });
+      expect(mock.calls.startSession[3]?.approvalMode).toBe("promptUnmatched");
     }).pipe(
       Effect.provideService(
         ChildProcessSpawner.ChildProcessSpawner,
