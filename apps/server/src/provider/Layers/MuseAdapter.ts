@@ -104,7 +104,7 @@ interface PendingUserInput {
 }
 
 interface ActiveTurnSettlement {
-  readonly turnId: TurnId;
+  readonly turnId: TurnId | undefined;
   readonly deferred: Deferred.Deferred<void, never>;
 }
 
@@ -117,6 +117,7 @@ interface MuseSessionContext {
   turns: Array<{ id: TurnId; items: Array<unknown> }>;
   activeTurnId: TurnId | undefined;
   activeTurnSettlement: ActiveTurnSettlement | undefined;
+  stopping: boolean;
   stopped: boolean;
 }
 
@@ -248,12 +249,19 @@ export function makeMuseAdapter(
 
         switch (notif.method) {
           case "turn/started": {
-            const turnId = TurnId.make(String(params.turnId ?? ""));
+            const rawTurnId = typeof params.turnId === "string" ? params.turnId : "";
+            if (!rawTurnId) break;
+            const turnId = TurnId.make(rawTurnId);
             ctx.activeTurnId = turnId;
-            if (
-              !ctx.activeTurnSettlement ||
-              String(ctx.activeTurnSettlement.turnId) !== String(turnId)
-            ) {
+            if (!ctx.activeTurnSettlement) {
+              const deferred = yield* Deferred.make<void>();
+              ctx.activeTurnSettlement = { turnId, deferred };
+            } else if (ctx.activeTurnSettlement.turnId === undefined) {
+              ctx.activeTurnSettlement = {
+                turnId,
+                deferred: ctx.activeTurnSettlement.deferred,
+              };
+            } else if (String(ctx.activeTurnSettlement.turnId) !== String(turnId)) {
               const deferred = yield* Deferred.make<void>();
               ctx.activeTurnSettlement = { turnId, deferred };
             }
@@ -277,32 +285,46 @@ export function makeMuseAdapter(
           }
 
           case "turn/completed": {
-            const turnId = TurnId.make(String(params.turnId ?? ctx.activeTurnId ?? ""));
+            const rawTurnId =
+              typeof params.turnId === "string" && params.turnId.length > 0
+                ? params.turnId
+                : ctx.activeTurnId
+                  ? String(ctx.activeTurnId)
+                  : undefined;
+            if (!rawTurnId) break;
+            const turnId = TurnId.make(rawTurnId);
             const terminal = typeof params.terminal === "string" ? params.terminal : undefined;
             const state = mapMuseTurnTerminalToState(terminal);
             const err = isRecord(params.error) ? (params.error as { message?: string }) : undefined;
 
-            // Settle turn completion signal if it matches the active turn
-            if (ctx.activeTurnSettlement) {
-              const matchesTurnId =
-                !params.turnId ||
-                !ctx.activeTurnSettlement.turnId ||
-                String(ctx.activeTurnSettlement.turnId) === String(params.turnId);
-              if (matchesTurnId) {
-                yield* Deferred.succeed(ctx.activeTurnSettlement.deferred, void 0).pipe(
-                  Effect.ignore,
-                );
-                ctx.activeTurnSettlement = undefined;
+            // Settle only the matching turn. A late completion from an older turn must
+            // never settle or overwrite state belonging to a newer active turn.
+            const settlement = ctx.activeTurnSettlement;
+            if (settlement) {
+              const matchesSettlement =
+                settlement.turnId === undefined ||
+                typeof params.turnId !== "string" ||
+                String(settlement.turnId) === rawTurnId;
+              if (matchesSettlement) {
+                yield* Deferred.succeed(settlement.deferred, void 0).pipe(Effect.ignore);
+                if (ctx.activeTurnSettlement === settlement) {
+                  ctx.activeTurnSettlement = undefined;
+                }
               }
             }
 
-            ctx.activeTurnId = undefined;
-            const { activeTurnId: _activeTurnId, ...readySession } = ctx.session;
-            ctx.session = {
-              ...readySession,
-              status: "ready",
-              updatedAt: stamp.createdAt,
-            };
+            const completesCurrentTurn =
+              ctx.activeTurnId === undefined || String(ctx.activeTurnId) === rawTurnId;
+            if (completesCurrentTurn) {
+              ctx.activeTurnId = undefined;
+              const { activeTurnId: _activeTurnId, ...readySession } = ctx.session;
+              ctx.session = {
+                ...readySession,
+                status: "ready",
+                updatedAt: stamp.createdAt,
+              };
+            }
+
             yield* offerEvent(
               makeMspTurnCompletedEvent({
                 stamp,
@@ -324,7 +346,14 @@ export function makeMuseAdapter(
             if (!item) break;
             const kind = String(item.kind ?? "");
             const itemId = String(item.itemId ?? "");
-            const turnId = ctx.activeTurnId ?? TurnId.make(String(item.turnId ?? ""));
+            const rawTurnId =
+              typeof item.turnId === "string" && item.turnId.length > 0
+                ? item.turnId
+                : ctx.activeTurnId
+                  ? String(ctx.activeTurnId)
+                  : undefined;
+            if (!rawTurnId) break;
+            const turnId = TurnId.make(rawTurnId);
             if (kind === "agentMessage") {
               yield* offerEvent(
                 makeMspAssistantItemStartedEvent({
@@ -359,7 +388,14 @@ export function makeMuseAdapter(
             const itemId = String(params.itemId ?? "");
             const delta = String(params.delta ?? "");
             const field = typeof params.field === "string" ? params.field : undefined;
-            const turnId = ctx.activeTurnId ?? TurnId.make("");
+            const rawTurnId =
+              typeof params.turnId === "string" && params.turnId.length > 0
+                ? params.turnId
+                : ctx.activeTurnId
+                  ? String(ctx.activeTurnId)
+                  : undefined;
+            if (!rawTurnId) break;
+            const turnId = TurnId.make(rawTurnId);
             const streamKind = field?.startsWith("summary")
               ? ("reasoning_text" as const)
               : field === "output"
@@ -386,7 +422,14 @@ export function makeMuseAdapter(
             if (!item) break;
             const kind = String(item.kind ?? "");
             const itemId = String(item.itemId ?? "");
-            const turnId = ctx.activeTurnId ?? TurnId.make(String(item.turnId ?? ""));
+            const rawTurnId =
+              typeof item.turnId === "string" && item.turnId.length > 0
+                ? item.turnId
+                : ctx.activeTurnId
+                  ? String(ctx.activeTurnId)
+                  : undefined;
+            if (!rawTurnId) break;
+            const turnId = TurnId.make(rawTurnId);
             if (kind === "agentMessage") {
               yield* offerEvent(
                 makeMspAssistantItemCompletedEvent({
@@ -431,7 +474,7 @@ export function makeMuseAdapter(
                 provider: PROVIDER,
                 providerInstanceId: boundInstanceId,
                 threadId,
-                turnId: ctx.activeTurnId,
+                turnId: req.turnId ? TurnId.make(req.turnId) : ctx.activeTurnId,
                 approvalRequest: req,
                 rawPayload: params,
               }),
@@ -443,13 +486,17 @@ export function makeMuseAdapter(
             const reqId = ApprovalRequestId.make(String(params.approvalId ?? ""));
             ctx.pendingApprovals.delete(reqId);
             const decisionStr = String(params.decision ?? "");
+            const resolvedTurnId =
+              typeof params.turnId === "string" && params.turnId.length > 0
+                ? TurnId.make(params.turnId)
+                : ctx.activeTurnId;
             yield* offerEvent(
               makeMspRequestResolvedEvent({
                 stamp,
                 provider: PROVIDER,
                 providerInstanceId: boundInstanceId,
                 threadId,
-                turnId: ctx.activeTurnId,
+                turnId: resolvedTurnId,
                 approvalId: reqId,
                 decision: mapMuseApprovalDecision(decisionStr),
               }),
@@ -468,7 +515,7 @@ export function makeMuseAdapter(
                 provider: PROVIDER,
                 providerInstanceId: boundInstanceId,
                 threadId,
-                turnId: ctx.activeTurnId,
+                turnId: req.turnId ? TurnId.make(req.turnId) : ctx.activeTurnId,
                 userInputRequest: req,
                 rawPayload: params,
               }),
@@ -480,13 +527,17 @@ export function makeMuseAdapter(
             const reqId = ApprovalRequestId.make(String(params.userInputId ?? ""));
             ctx.pendingUserInputs.delete(reqId);
             const answers = asRecord(params.answers);
+            const settledTurnId =
+              typeof params.turnId === "string" && params.turnId.length > 0
+                ? TurnId.make(params.turnId)
+                : ctx.activeTurnId;
             yield* offerEvent(
               makeMspUserInputResolvedEvent({
                 stamp,
                 provider: PROVIDER,
                 providerInstanceId: boundInstanceId,
                 threadId,
-                turnId: ctx.activeTurnId,
+                turnId: settledTurnId,
                 userInputId: reqId,
                 answers,
               }),
@@ -546,6 +597,17 @@ export function makeMuseAdapter(
 
     const startSession: MuseAdapterShape["startSession"] = (input) =>
       Effect.gen(function* () {
+        const existing = sessions.get(input.threadId);
+        if (existing && !existing.stopped) {
+          return yield* Effect.fail(
+            new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "startSession",
+              issue: `Muse session already exists for thread ${input.threadId}`,
+            }),
+          );
+        }
+
         const host = yield* getHost;
         const commandId = newMspCommandId();
         const modelId = input.modelSelection?.model;
@@ -591,6 +653,7 @@ export function makeMuseAdapter(
           turns: [],
           activeTurnId: undefined,
           activeTurnSettlement: undefined,
+          stopping: false,
           stopped: false,
         };
 
@@ -601,6 +664,15 @@ export function makeMuseAdapter(
     const sendTurn: MuseAdapterShape["sendTurn"] = (input) =>
       Effect.gen(function* () {
         const ctx = yield* requireSession(input.threadId);
+        if (ctx.stopping) {
+          return yield* Effect.fail(
+            new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "turn/start",
+              detail: `Muse session for thread ${input.threadId} is stopping; cannot start a new turn`,
+            }),
+          );
+        }
         const host = yield* getHost;
 
         const turnParts: MspTurnInputPart[] = [
@@ -695,10 +767,15 @@ export function makeMuseAdapter(
 
         const turnId = TurnId.make(result.turnId);
         ctx.activeTurnId = turnId;
-        if (
-          !ctx.activeTurnSettlement ||
-          String(ctx.activeTurnSettlement.turnId) !== String(turnId)
-        ) {
+        if (!ctx.activeTurnSettlement) {
+          const deferred = yield* Deferred.make<void>();
+          ctx.activeTurnSettlement = { turnId, deferred };
+        } else if (ctx.activeTurnSettlement.turnId === undefined) {
+          ctx.activeTurnSettlement = {
+            turnId,
+            deferred: ctx.activeTurnSettlement.deferred,
+          };
+        } else if (String(ctx.activeTurnSettlement.turnId) !== String(turnId)) {
           const deferred = yield* Deferred.make<void>();
           ctx.activeTurnSettlement = { turnId, deferred };
         }
@@ -868,84 +945,123 @@ export function makeMuseAdapter(
       Effect.gen(function* () {
         const ctx = sessions.get(threadId);
         if (!ctx || ctx.stopped) return;
+        if (ctx.stopping) {
+          return yield* Effect.fail(
+            new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "stopSession",
+              detail: `Muse session stop is already in progress for thread ${threadId}`,
+            }),
+          );
+        }
 
-        const hostOpt = yield* SynchronizedRef.get(hostRef);
-        if (Option.isSome(hostOpt)) {
-          const host = hostOpt.value;
-
-          // 1. If an active turn is running, interrupt it and wait for settlement before modifying session ownership.
-          // In MSP, `turn/interrupt` is the canonical "user pressed stop" priority lane operation.
-          // Acceptance of `turn/interrupt` admits the interrupt; the turn is over only when `turn/completed` arrives.
+        ctx.stopping = true;
+        return yield* Effect.gen(function* () {
+          const hostOpt = yield* SynchronizedRef.get(hostRef);
           const activeTurnId = ctx.activeTurnId;
           const isRunning = ctx.session.status === "running";
 
-          if (activeTurnId || isRunning) {
-            let settlement = ctx.activeTurnSettlement?.deferred;
-            if (!settlement) {
-              settlement = yield* Deferred.make<void>();
-              ctx.activeTurnSettlement = {
-                turnId: activeTurnId ?? TurnId.make("unknown"),
-                deferred: settlement,
-              };
-            }
-
-            yield* host
-              .interruptTurn({
-                commandId: newMspCommandId(),
-                sessionId: ctx.mspSessionId,
-                ...(activeTurnId ? { turnId: String(activeTurnId) } : {}),
-              })
-              .pipe(
-                Effect.catch((cause) =>
-                  Effect.gen(function* () {
-                    // If the turn completed naturally while interrupt was in flight,
-                    // execution has already stopped cleanly.
-                    if (yield* Deferred.isDone(settlement)) {
-                      return undefined;
-                    }
-                    return yield* Effect.fail(
-                      new ProviderAdapterRequestError({
-                        provider: PROVIDER,
-                        method: "turn/interrupt",
-                        detail: `Muse failed to interrupt active turn ${activeTurnId ?? ""} for thread ${threadId}: ${cause.detail ?? cause.message ?? String(cause)}`,
-                        cause,
-                      }),
-                    );
-                  }),
-                ),
-              );
-
-            // Yield a tick so any concurrently arriving notification has processed
-            yield* Effect.yieldNow;
-
-            // Wait for turn settlement notification (`turn/completed`) with bounded timeout
-            const isDone = yield* Deferred.isDone(settlement);
-            if (!isDone) {
-              yield* Deferred.await(settlement).pipe(
-                Effect.timeoutOrElse({
-                  duration: stopTurnTimeout,
-                  orElse: () =>
-                    Effect.fail(
-                      new ProviderAdapterRequestError({
-                        provider: PROVIDER,
-                        method: "turn/interrupt",
-                        detail: `Muse turn settlement timed out after ${Duration.toMillis(stopTurnTimeout)}ms for thread ${threadId} (turn ${activeTurnId ?? "unknown"})`,
-                      }),
-                    ),
-                }),
-              );
-            }
+          if (Option.isNone(hostOpt) && (activeTurnId || isRunning)) {
+            return yield* Effect.fail(
+              new ProviderAdapterProcessError({
+                provider: PROVIDER,
+                threadId,
+                detail: `Muse host is unavailable while thread ${threadId} still appears to be running`,
+              }),
+            );
           }
 
-          // 2. Unsubscribe view. Execution is confirmed stopped (settled).
-          // Failure to unsubscribe view is non-fatal to execution safety and
-          // should not prevent T3 from releasing local resources.
-          yield* host.unsubscribeView({ sessionId: ctx.mspSessionId }).pipe(Effect.ignore);
-        }
+          if (Option.isSome(hostOpt)) {
+            const host = hostOpt.value;
 
-        // 3. Mark stopped and remove local state ONLY after execution has been stopped
-        ctx.stopped = true;
-        sessions.delete(threadId);
+            // 1. If an active turn is running, interrupt it and wait for settlement before modifying session ownership.
+            // In MSP, `turn/interrupt` is the canonical "user pressed stop" priority lane operation.
+            // Acceptance of `turn/interrupt` admits the interrupt; the turn is over only when `turn/completed` arrives.
+            if (activeTurnId || isRunning) {
+              let settlementState = ctx.activeTurnSettlement;
+              if (!settlementState) {
+                const deferred = yield* Deferred.make<void>();
+                settlementState = { turnId: activeTurnId, deferred };
+                ctx.activeTurnSettlement = settlementState;
+              } else if (settlementState.turnId === undefined && activeTurnId) {
+                settlementState = { turnId: activeTurnId, deferred: settlementState.deferred };
+                ctx.activeTurnSettlement = settlementState;
+              } else if (
+                activeTurnId &&
+                settlementState.turnId &&
+                String(settlementState.turnId) !== String(activeTurnId)
+              ) {
+                const deferred = yield* Deferred.make<void>();
+                settlementState = { turnId: activeTurnId, deferred };
+                ctx.activeTurnSettlement = settlementState;
+              }
+              const settlement = settlementState.deferred;
+
+              yield* host
+                .interruptTurn({
+                  commandId: newMspCommandId(),
+                  sessionId: ctx.mspSessionId,
+                  ...(activeTurnId ? { turnId: String(activeTurnId) } : {}),
+                })
+                .pipe(
+                  Effect.catch((cause) =>
+                    Effect.gen(function* () {
+                      // If the turn completed naturally while interrupt was in flight,
+                      // execution has already stopped cleanly.
+                      if (yield* Deferred.isDone(settlement)) {
+                        return undefined;
+                      }
+                      return yield* Effect.fail(
+                        new ProviderAdapterRequestError({
+                          provider: PROVIDER,
+                          method: "turn/interrupt",
+                          detail: `Muse failed to interrupt active turn ${activeTurnId ?? ""} for thread ${threadId}: ${cause.detail ?? cause.message ?? String(cause)}`,
+                          cause,
+                        }),
+                      );
+                    }),
+                  ),
+                );
+
+              // Yield a tick so any concurrently arriving notification has processed
+              yield* Effect.yieldNow;
+
+              // Wait for turn settlement notification (`turn/completed`) with bounded timeout
+              const isDone = yield* Deferred.isDone(settlement);
+              if (!isDone) {
+                yield* Deferred.await(settlement).pipe(
+                  Effect.timeoutOrElse({
+                    duration: stopTurnTimeout,
+                    orElse: () =>
+                      Effect.fail(
+                        new ProviderAdapterRequestError({
+                          provider: PROVIDER,
+                          method: "turn/interrupt",
+                          detail: `Muse turn settlement timed out after ${Duration.toMillis(stopTurnTimeout)}ms for thread ${threadId} (turn ${activeTurnId ?? "unknown"})`,
+                        }),
+                      ),
+                  }),
+                );
+              }
+            }
+
+            // 2. Unsubscribe view. Execution is confirmed stopped (settled).
+            // Failure to unsubscribe view is non-fatal to execution safety and
+            // should not prevent T3 from releasing local resources.
+            yield* host.unsubscribeView({ sessionId: ctx.mspSessionId }).pipe(Effect.ignore);
+          }
+
+          // 3. Mark stopped and remove local state ONLY after execution has been stopped
+          ctx.stopping = false;
+          ctx.stopped = true;
+          sessions.delete(threadId);
+        }).pipe(
+          Effect.tapError(() =>
+            Effect.sync(() => {
+              ctx.stopping = false;
+            }),
+          ),
+        );
       });
 
     const stopAll: MuseAdapterShape["stopAll"] = () =>
@@ -955,9 +1071,19 @@ export function makeMuseAdapter(
         }
         const currentHost = yield* SynchronizedRef.get(hostRef);
         if (Option.isSome(currentHost)) {
-          yield* currentHost.value.close.pipe(Effect.ignore);
+          // Closing the persistent host force-terminates any turn that failed to
+          // settle during the best-effort per-session stop pass.
+          yield* currentHost.value.close;
           yield* SynchronizedRef.set(hostRef, Option.none());
         }
+
+        // Once the host is closed (or absent), no Muse execution can remain alive.
+        // Do not leave stale/ghost sessions visible to T3 after stopAll.
+        for (const ctx of sessions.values()) {
+          ctx.stopping = false;
+          ctx.stopped = true;
+        }
+        sessions.clear();
       });
 
     const listSessions: MuseAdapterShape["listSessions"] = () =>
