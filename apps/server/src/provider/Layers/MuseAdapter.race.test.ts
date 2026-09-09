@@ -11,11 +11,7 @@ import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawne
 
 import { ServerConfig } from "../../config.ts";
 import { type MspHost, type MspNotification, MspTransportError } from "../msp/MspClient.ts";
-import type {
-  MspModelInfo,
-  MspSessionStartResult,
-  MspTurnStartResult,
-} from "../msp/MspTypes.ts";
+import type { MspModelInfo, MspSessionStartResult, MspTurnStartResult } from "../msp/MspTypes.ts";
 import { makeMuseAdapter } from "./MuseAdapter.ts";
 
 const testLayer = ServerConfig.layerTest(process.cwd(), {
@@ -232,35 +228,37 @@ it.layer(testLayer)("MuseAdapter race hardening", (it) => {
     ),
   );
 
-  it.effect("stopAll force-closes the host and removes sessions after per-session stop failure", () =>
-    Effect.gen(function* () {
-      const mock = yield* makeRaceMockHost;
-      const adapter = yield* makeMuseAdapter(
-        { enabled: true, binaryPath: "", customModels: [] },
-        {
-          instanceId: ProviderInstanceId.make("muse-race"),
-          makeHost: () => Effect.succeed(mock.host),
-        },
-      );
-      const threadId = ThreadId.make("race-stop-all");
+  it.effect(
+    "stopAll force-closes the host and removes sessions after per-session stop failure",
+    () =>
+      Effect.gen(function* () {
+        const mock = yield* makeRaceMockHost;
+        const adapter = yield* makeMuseAdapter(
+          { enabled: true, binaryPath: "", customModels: [] },
+          {
+            instanceId: ProviderInstanceId.make("muse-race"),
+            makeHost: () => Effect.succeed(mock.host),
+          },
+        );
+        const threadId = ThreadId.make("race-stop-all");
 
-      yield* adapter.startSession({ threadId, cwd: "/test", runtimeMode: "approval-required" });
-      yield* adapter.sendTurn({ threadId, input: "interrupt fails" });
-      mock.calls.failInterrupt = true;
+        yield* adapter.startSession({ threadId, cwd: "/test", runtimeMode: "approval-required" });
+        yield* adapter.sendTurn({ threadId, input: "interrupt fails" });
+        mock.calls.failInterrupt = true;
 
-      yield* adapter.stopAll();
+        yield* adapter.stopAll();
 
-      expect(mock.calls.interruptTurn).toBe(1);
-      expect(mock.calls.close).toBe(1);
-      expect(yield* adapter.hasSession(threadId)).toBe(false);
-      expect((yield* adapter.listSessions()).length).toBe(0);
-    }).pipe(
-      Effect.provideService(
-        ChildProcessSpawner.ChildProcessSpawner,
-        ChildProcessSpawner.make(() => Effect.die("Mock host does not spawn")),
+        expect(mock.calls.interruptTurn).toBe(1);
+        expect(mock.calls.close).toBe(1);
+        expect(yield* adapter.hasSession(threadId)).toBe(false);
+        expect((yield* adapter.listSessions()).length).toBe(0);
+      }).pipe(
+        Effect.provideService(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make(() => Effect.die("Mock host does not spawn")),
+        ),
+        Effect.scoped,
       ),
-      Effect.scoped,
-    ),
   );
 
   it.effect("startSession refuses to overwrite an already-owned thread", () =>
