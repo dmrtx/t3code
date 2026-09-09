@@ -38,13 +38,24 @@ const testLayer = ServerConfig.layerTest(process.cwd(), {
   prefix: "t3-muse-integration-test-",
 }).pipe(Layer.provideMerge(NodeServices.layer));
 
+function summarizeEvents(events: ReadonlyArray<any>): string {
+  return JSON.stringify(
+    events.map((event) => ({
+      type: event?.type,
+      turnId: event?.turnId ? String(event.turnId) : undefined,
+      itemId: event?.itemId ? String(event.itemId) : undefined,
+      state: event?.payload?.state,
+    })),
+  );
+}
+
 function waitForTurnCompleted(
   eventsQueue: Queue.Queue<any>,
   targetTurnId: TurnId,
   timeoutDuration: Duration.Input = "15 seconds",
 ) {
+  const receivedEvents: Array<any> = [];
   return Effect.gen(function* () {
-    const receivedEvents: Array<any> = [];
     while (true) {
       const event = yield* Queue.take(eventsQueue);
       receivedEvents.push(event);
@@ -57,7 +68,7 @@ function waitForTurnCompleted(
       duration: timeoutDuration,
       orElse: () =>
         Effect.die(
-          `Timed out waiting for turn.completed for turn ${targetTurnId} after ${Duration.toMillis(Duration.fromInputUnsafe(timeoutDuration))}ms`,
+          `Timed out waiting for turn.completed for turn ${targetTurnId} after ${Duration.toMillis(Duration.fromInputUnsafe(timeoutDuration))}ms; received=${summarizeEvents(receivedEvents)}`,
         ),
     }),
   );
@@ -96,7 +107,6 @@ describe.skipIf(!resolvedMuseBinary)("MuseAdapter live integration with muse ser
 
             const threadId = ThreadId.make("live-continuity-thread");
 
-            // 1. Start session
             const session = yield* adapter.startSession({
               threadId,
               cwd: tempDir,
@@ -106,11 +116,13 @@ describe.skipIf(!resolvedMuseBinary)("MuseAdapter live integration with muse ser
                 model: "echo",
               },
             });
+            // Give the host notification forwarding fiber an explicit scheduling
+            // point before the first ultra-fast echo turn can complete.
+            yield* Effect.yieldNow;
 
             expect(session.threadId).toBe(threadId);
             expect(session.status).toBe("ready");
 
-            // 2. Send turn #1 using echo
             const turn1 = yield* adapter.sendTurn({
               threadId,
               input: "Hello from turn 1",
@@ -119,7 +131,6 @@ describe.skipIf(!resolvedMuseBinary)("MuseAdapter live integration with muse ser
             expect(turn1.threadId).toBe(threadId);
             expect(turn1.turnId).toBeDefined();
 
-            // Wait for turn #1 turn.completed event
             const turn1Result = yield* waitForTurnCompleted(
               eventsQueue,
               turn1.turnId,
@@ -129,13 +140,11 @@ describe.skipIf(!resolvedMuseBinary)("MuseAdapter live integration with muse ser
             expect(turn1Result.receivedEvents.some((e) => e.type === "turn.started")).toBe(true);
             expect(turn1Result.receivedEvents.some((e) => e.type === "turn.completed")).toBe(true);
 
-            // Verify session returns to ready after turn #1
             const sessionsAfterTurn1 = yield* adapter.listSessions();
             expect(sessionsAfterTurn1.length).toBe(1);
             expect(sessionsAfterTurn1[0]?.threadId).toBe(threadId);
             expect(sessionsAfterTurn1[0]?.status).toBe("ready");
 
-            // 3. Send turn #2 through the SAME T3 thread/session
             const turn2 = yield* adapter.sendTurn({
               threadId,
               input: "Hello from turn 2 on the same session",
@@ -143,11 +152,8 @@ describe.skipIf(!resolvedMuseBinary)("MuseAdapter live integration with muse ser
 
             expect(turn2.threadId).toBe(threadId);
             expect(turn2.turnId).toBeDefined();
-
-            // Verify two distinct turn IDs
             expect(String(turn1.turnId)).not.toBe(String(turn2.turnId));
 
-            // Wait for turn #2 turn.completed event
             const turn2Result = yield* waitForTurnCompleted(
               eventsQueue,
               turn2.turnId,
@@ -157,13 +163,11 @@ describe.skipIf(!resolvedMuseBinary)("MuseAdapter live integration with muse ser
             expect(turn2Result.receivedEvents.some((e) => e.type === "turn.started")).toBe(true);
             expect(turn2Result.receivedEvents.some((e) => e.type === "turn.completed")).toBe(true);
 
-            // 4. Verify adapter still owns exactly the same session/thread
             const sessionsAfterTurn2 = yield* adapter.listSessions();
             expect(sessionsAfterTurn2.length).toBe(1);
             expect(sessionsAfterTurn2[0]?.threadId).toBe(threadId);
             expect(sessionsAfterTurn2[0]?.status).toBe("ready");
 
-            // 5. Clean stop
             yield* adapter.stopSession(threadId);
             expect(yield* adapter.hasSession(threadId)).toBe(false);
 
