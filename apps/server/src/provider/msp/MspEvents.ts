@@ -137,20 +137,25 @@ export function mapMuseApprovalDecision(decision: string): ProviderApprovalDecis
  * In `muse schema`, `TurnTerminal = "completed" | "failed" | "cancelled" | (string & {})`.
  * Acceptance of `turn/interrupt` means the interrupt was admitted, and the turn is
  * over when `turn/completed` arrives with terminal `"cancelled"`.
+ *
+ * Fails closed: any unrecognized terminal string maps to canonical `"failed"`.
  */
 export function mapMuseTurnTerminalToState(
   terminal?: string,
 ): "completed" | "failed" | "interrupted" | "cancelled" {
   switch (terminal) {
-    case "failed":
-      return "failed";
+    case "completed":
+    case undefined:
+      return "completed";
     case "interrupted":
       return "interrupted";
     case "cancelled":
     case "canceled":
       return "cancelled";
+    case "failed":
+      return "failed";
     default:
-      return "completed";
+      return "failed";
   }
 }
 

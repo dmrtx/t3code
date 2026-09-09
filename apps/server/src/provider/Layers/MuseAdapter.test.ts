@@ -10,11 +10,13 @@ import {
   TurnId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 
 import { ServerConfig } from "../../config.ts";
@@ -43,6 +45,7 @@ const makeMockHost = Effect.gen(function* () {
   const notifPubSub = yield* PubSub.unbounded<MspNotification>();
   const calls = {
     shouldFailInterrupt: false,
+    onInterruptTurn: undefined as (() => Effect.Effect<void>) | undefined,
     startSession: [] as MspSessionStartParams[],
     startTurn: [] as MspTurnStartParams[],
     interruptTurn: [] as Array<{
@@ -98,6 +101,10 @@ const makeMockHost = Effect.gen(function* () {
     interruptTurn: (params) =>
       Effect.gen(function* () {
         calls.interruptTurn.push(params);
+        if (calls.onInterruptTurn) {
+          yield* calls.onInterruptTurn();
+          yield* Effect.yieldNow;
+        }
         if (calls.shouldFailInterrupt) {
           return yield* Effect.fail(
             new MspTransportError({
@@ -200,6 +207,7 @@ it.layer(testLayer)("MuseAdapter", (it) => {
         cwd: "/workspace/project",
         runtimeMode: "approval-required",
       });
+      yield* Effect.yieldNow;
 
       expect(session.threadId).toBe(threadId);
       expect(session.status).toBe("ready");
@@ -228,6 +236,15 @@ it.layer(testLayer)("MuseAdapter", (it) => {
       // Interrupt turn
       yield* adapter.interruptTurn(threadId, TurnId.make("msp-turn-101"));
       expect(mock.calls.interruptTurn.length).toBe(1);
+      yield* mock.emitNotification({
+        method: "turn/completed",
+        params: {
+          sessionId: "msp-sess-42",
+          turnId: "msp-turn-101",
+          terminal: "cancelled",
+        },
+      });
+      yield* Effect.yieldNow;
 
       // Native compaction
       if (adapter.compaction?.type === "native") {
@@ -473,11 +490,67 @@ it.layer(testLayer)("MuseAdapter", (it) => {
   );
 
   it.effect(
-    "stopSession interrupts active turn and unsubscribes view before removing local state",
+    "stopSession: interrupt RPC succeeds, but no turn/completed arrives -> times out, fails, session retained by T3",
     () =>
       Effect.gen(function* () {
         const mock = yield* makeMockHost;
-        const threadId = ThreadId.make("thread-stop-active");
+        const threadId = ThreadId.make("thread-stop-no-completed");
+
+        const adapter = yield* makeMuseAdapter(
+          { enabled: true, binaryPath: "", customModels: [] },
+          {
+            instanceId: ProviderInstanceId.make("muse-primary"),
+            stopTurnTimeout: "50 millis",
+            makeHost: () => Effect.succeed(mock.host),
+          },
+        );
+
+        yield* adapter.startSession({
+          threadId,
+          cwd: "/test",
+          runtimeMode: "approval-required",
+        });
+
+        yield* adapter.sendTurn({
+          threadId,
+          input: "Run a command",
+        });
+
+        // Fork stopSession which will issue turn/interrupt and wait for settlement
+        const stopFiber = yield* adapter.stopSession(threadId).pipe(Effect.exit, Effect.forkScoped);
+        yield* Effect.yieldNow;
+
+        // Advance TestClock past stopTurnTimeout (50 millis)
+        yield* TestClock.adjust("100 millis");
+
+        const stopExit = yield* Fiber.join(stopFiber);
+        expect(stopExit._tag).toBe("Failure");
+
+        // Interrupt was attempted
+        expect(mock.calls.interruptTurn.length).toBe(1);
+
+        // View was NOT unsubscribed because turn did not settle
+        expect(mock.calls.unsubscribeView.length).toBe(0);
+
+        // CRITICAL INVARIANT: Session MUST remain owned by T3 (not deleted)
+        expect(yield* adapter.hasSession(threadId)).toBe(true);
+        const list = yield* adapter.listSessions();
+        expect(list.find((s) => s.threadId === threadId)).toBeDefined();
+      }).pipe(
+        Effect.provideService(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make(() => Effect.die("Mock host does not spawn")),
+        ),
+        Effect.scoped,
+      ),
+  );
+
+  it.effect(
+    "stopSession: interrupt RPC succeeds, then turn/completed(cancelled) arrives -> completes, unsubscribes, session removed",
+    () =>
+      Effect.gen(function* () {
+        const mock = yield* makeMockHost;
+        const threadId = ThreadId.make("thread-stop-settle");
 
         const adapter = yield* makeMuseAdapter(
           { enabled: true, binaryPath: "", customModels: [] },
@@ -493,7 +566,6 @@ it.layer(testLayer)("MuseAdapter", (it) => {
           runtimeMode: "approval-required",
         });
 
-        // Start a turn so that activeTurnId is set and status is 'running'
         yield* adapter.sendTurn({
           threadId,
           input: "Run a command",
@@ -502,22 +574,141 @@ it.layer(testLayer)("MuseAdapter", (it) => {
         expect(mock.calls.interruptTurn.length).toBe(0);
         expect(mock.calls.unsubscribeView.length).toBe(0);
 
-        // Stop session while turn is active
-        yield* adapter.stopSession(threadId);
+        // Fork stopSession which will issue turn/interrupt and await settlement
+        const stopFiber = yield* adapter.stopSession(threadId).pipe(Effect.forkScoped);
+        yield* Effect.yieldNow;
 
-        // Verify that turn was interrupted
+        // Verify interrupt was called
         expect(mock.calls.interruptTurn.length).toBe(1);
-        expect(mock.calls.interruptTurn[0]?.sessionId).toBe("msp-sess-42");
-        expect(mock.calls.interruptTurn[0]?.turnId).toBe("msp-turn-101");
 
-        // Verify view was unsubscribed
+        // Emit turn/completed notification with terminal 'cancelled'
+        yield* mock.emitNotification({
+          method: "turn/completed",
+          params: {
+            sessionId: "msp-sess-42",
+            turnId: "msp-turn-101",
+            terminal: "cancelled",
+          },
+        });
+
+        // Await stopSession completion
+        yield* Fiber.join(stopFiber);
+
+        // Verify view was unsubscribed and local state removed
         expect(mock.calls.unsubscribeView.length).toBe(1);
-        expect(mock.calls.unsubscribeView[0]?.sessionId).toBe("msp-sess-42");
-
-        // Verify local state was cleaned up
         expect(yield* adapter.hasSession(threadId)).toBe(false);
         const list = yield* adapter.listSessions();
         expect(list.find((s) => s.threadId === threadId)).toBeUndefined();
+      }).pipe(
+        Effect.provideService(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make(() => Effect.die("Mock host does not spawn")),
+        ),
+        Effect.scoped,
+      ),
+  );
+
+  it.effect(
+    "stopSession: turn/completed arrives immediately / before interrupt RPC resolves -> no race or deadlock, completes safely",
+    () =>
+      Effect.gen(function* () {
+        const mock = yield* makeMockHost;
+        const threadId = ThreadId.make("thread-stop-early-completion");
+
+        const adapter = yield* makeMuseAdapter(
+          { enabled: true, binaryPath: "", customModels: [] },
+          {
+            instanceId: ProviderInstanceId.make("muse-primary"),
+            stopTurnTimeout: "100 millis",
+            makeHost: () => Effect.succeed(mock.host),
+          },
+        );
+
+        yield* adapter.startSession({
+          threadId,
+          cwd: "/test",
+          runtimeMode: "approval-required",
+        });
+
+        yield* adapter.sendTurn({
+          threadId,
+          input: "Run a command",
+        });
+
+        // Simulate turn/completed arriving BEFORE the turn/interrupt RPC response returns
+        mock.calls.onInterruptTurn = () =>
+          mock.emitNotification({
+            method: "turn/completed",
+            params: {
+              sessionId: "msp-sess-42",
+              turnId: "msp-turn-101",
+              terminal: "cancelled",
+            },
+          });
+
+        // stopSession must complete without deadlock or missing the event
+        const stopFiber = yield* adapter.stopSession(threadId).pipe(Effect.forkScoped);
+        yield* Effect.yieldNow;
+        yield* Fiber.join(stopFiber);
+
+        expect(mock.calls.interruptTurn.length).toBe(1);
+        expect(mock.calls.unsubscribeView.length).toBe(1);
+        expect(yield* adapter.hasSession(threadId)).toBe(false);
+      }).pipe(
+        Effect.provideService(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make(() => Effect.die("Mock host does not spawn")),
+        ),
+        Effect.scoped,
+      ),
+  );
+
+  it.effect(
+    "stopSession: natural completion race while interrupt in flight -> completes safely without treating completed turn as unsafe",
+    () =>
+      Effect.gen(function* () {
+        const mock = yield* makeMockHost;
+        const threadId = ThreadId.make("thread-stop-natural-race");
+
+        const adapter = yield* makeMuseAdapter(
+          { enabled: true, binaryPath: "", customModels: [] },
+          {
+            instanceId: ProviderInstanceId.make("muse-primary"),
+            makeHost: () => Effect.succeed(mock.host),
+          },
+        );
+
+        yield* adapter.startSession({
+          threadId,
+          cwd: "/test",
+          runtimeMode: "approval-required",
+        });
+
+        yield* adapter.sendTurn({
+          threadId,
+          input: "Run a command",
+        });
+
+        // Turn completes naturally with 'completed', and Muse returns an error on interrupt
+        // (e.g. "turn no longer active")
+        mock.calls.onInterruptTurn = () =>
+          mock.emitNotification({
+            method: "turn/completed",
+            params: {
+              sessionId: "msp-sess-42",
+              turnId: "msp-turn-101",
+              terminal: "completed",
+            },
+          });
+        mock.calls.shouldFailInterrupt = true;
+
+        // stopSession should recognize settlement was achieved and succeed cleanly
+        const stopFiber = yield* adapter.stopSession(threadId).pipe(Effect.forkScoped);
+        yield* Effect.yieldNow;
+        yield* Fiber.join(stopFiber);
+
+        expect(mock.calls.unsubscribeView.length).toBe(1);
+        expect(yield* adapter.hasSession(threadId)).toBe(false);
       }).pipe(
         Effect.provideService(
           ChildProcessSpawner.ChildProcessSpawner,
@@ -576,7 +767,18 @@ it.layer(testLayer)("MuseAdapter", (it) => {
 
         // Retry stopSession when interrupt succeeds
         mock.calls.shouldFailInterrupt = false;
-        yield* adapter.stopSession(threadId);
+        mock.calls.onInterruptTurn = () =>
+          mock.emitNotification({
+            method: "turn/completed",
+            params: {
+              sessionId: "msp-sess-42",
+              turnId: "msp-turn-101",
+              terminal: "cancelled",
+            },
+          });
+        const retryFiber = yield* adapter.stopSession(threadId).pipe(Effect.forkScoped);
+        yield* Effect.yieldNow;
+        yield* Fiber.join(retryFiber);
 
         expect(mock.calls.interruptTurn.length).toBe(2);
         expect(mock.calls.unsubscribeView.length).toBe(1);
@@ -599,6 +801,7 @@ it.layer(testLayer)("MuseAdapter", (it) => {
       expect(mapMuseTurnTerminalToState("cancelled")).toBe("cancelled");
       expect(mapMuseTurnTerminalToState("canceled")).toBe("cancelled");
       expect(mapMuseTurnTerminalToState(undefined)).toBe("completed");
+      expect(mapMuseTurnTerminalToState("unknown_future_terminal")).toBe("failed");
 
       // 2. Integration with event stream: emit turn/completed with terminal: "cancelled"
       const mock = yield* makeMockHost;
