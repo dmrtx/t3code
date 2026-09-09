@@ -8,11 +8,10 @@ import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
-import * as TestClock from "effect/testing/TestClock";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 
 import { ServerConfig } from "../../config.ts";
-import type { MspHost, MspNotification } from "../msp/MspClient.ts";
+import { type MspHost, type MspNotification, MspTransportError } from "../msp/MspClient.ts";
 import type {
   MspModelInfo,
   MspSessionStartResult,
@@ -29,6 +28,7 @@ const makeRaceMockHost = Effect.gen(function* () {
   let turnCounter = 0;
   const calls = {
     interruptTurn: 0,
+    failInterrupt: false,
     unsubscribeView: 0,
     close: 0,
   };
@@ -69,8 +69,16 @@ const makeRaceMockHost = Effect.gen(function* () {
         } satisfies MspTurnStartResult;
       }),
     interruptTurn: (params) =>
-      Effect.sync(() => {
+      Effect.gen(function* () {
         calls.interruptTurn += 1;
+        if (calls.failInterrupt) {
+          return yield* Effect.fail(
+            new MspTransportError({
+              operation: "turn/interrupt",
+              detail: "Simulated stopAll interrupt failure",
+            }),
+          );
+        }
         return {
           commandId: params.commandId,
           status: "interrupted",
@@ -128,6 +136,7 @@ it.layer(testLayer)("MuseAdapter race hardening", (it) => {
         Stream.runForEach((event) => Queue.offer(events, event)),
         Effect.forkScoped,
       );
+      yield* Effect.yieldNow;
 
       yield* adapter.startSession({ threadId, cwd: "/test", runtimeMode: "approval-required" });
       const turn1 = yield* adapter.sendTurn({ threadId, input: "first" });
@@ -224,27 +233,28 @@ it.layer(testLayer)("MuseAdapter race hardening", (it) => {
     ),
   );
 
-  it.effect("stopAll force-closes the host and removes sessions that could not settle", () =>
+  it.effect("stopAll force-closes the host and removes sessions after per-session stop failure", () =>
     Effect.gen(function* () {
       const mock = yield* makeRaceMockHost;
       const adapter = yield* makeMuseAdapter(
         { enabled: true, binaryPath: "", customModels: [] },
         {
           instanceId: ProviderInstanceId.make("muse-race"),
-          stopTurnTimeout: "50 millis",
           makeHost: () => Effect.succeed(mock.host),
         },
       );
       const threadId = ThreadId.make("race-stop-all");
 
       yield* adapter.startSession({ threadId, cwd: "/test", runtimeMode: "approval-required" });
-      yield* adapter.sendTurn({ threadId, input: "never settles" });
+      yield* adapter.sendTurn({ threadId, input: "interrupt fails" });
+      mock.calls.failInterrupt = true;
 
-      const stopAllFiber = yield* adapter.stopAll().pipe(Effect.forkScoped);
-      yield* Effect.yieldNow;
-      yield* TestClock.adjust("100 millis");
-      yield* Fiber.join(stopAllFiber);
+      // stopAll deliberately treats individual session stop as best-effort. Even
+      // when turn/interrupt fails, closing the persistent host guarantees no Muse
+      // execution remains alive; only then may residual T3 session state be cleared.
+      yield* adapter.stopAll();
 
+      expect(mock.calls.interruptTurn).toBe(1);
       expect(mock.calls.close).toBe(1);
       expect(yield* adapter.hasSession(threadId)).toBe(false);
       expect((yield* adapter.listSessions()).length).toBe(0);
